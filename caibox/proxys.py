@@ -1,6 +1,20 @@
+# -*- coding: utf-8 -*-
+#!/usr/bin/python
 """
-创建一个代理对象用来代理所有的不方便直接暴露的对象
+-------------------------------------------------
+   File Name：     proxys
+   Description :  一些代理类，用来代理不方便暴露的对象。
+   Author :       caiwanpeng
+   date：          2018/11/14
+-------------------------------------------------
+   Change Activity:
+                   2018/11/14:
+-------------------------------------------------
 """
+__author__ = 'caiwanpeng'
+
+__version__ = '1.1'
+
 import copy
 import sys
 
@@ -146,6 +160,3 @@ if __name__ == "__main__":
     class OtherObj(object):
         real_obj = MyDict()
     mydict_proxy = ObjProxy(OtherObj.real_obj)
-
-
-

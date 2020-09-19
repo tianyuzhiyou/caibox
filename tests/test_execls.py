@@ -5,7 +5,7 @@ __author__ = "caiwanpeng"
 """测试execl工具"""
 
 import unittest
-from caibox.execl_utils import ExportTest
+from pyreBox.execl_utils import ExportTest
 
 class TestExecl(unittest.TestCase):
 

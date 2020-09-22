@@ -8,12 +8,14 @@ redis4.0.0版本后内部支持了BloomFilter的插件，但是对于不想使�
 的BloomFilter
 """
 
+import json
+import base64
 import mmh3
 
 
 class ReBloomFilter(object):
 
-    def __init__(self, cache, name, size, error_rate=0.001, is_byte=True, hash_seed=41, is_init=True):
+    def __init__(self, cache, name, size, error_rate=0.001, is_byte=True, hash_seed=41, is_init=False, expire=None):
         """
         @desc 封装基于redis的bloom过滤器
         :param init_size: 初始的过滤器长度
@@ -23,6 +25,7 @@ class ReBloomFilter(object):
         :param is_byte: 是否自动将长度设置成8的倍数
         :param hash_seed: hash种子
         :param is_init: 是否初始化空间
+        :param expire: 失效时间s
         """
         if not (0 < error_rate < 1):
             raise ValueError("Error_Rate must be between 0 and 1.")
@@ -36,6 +39,7 @@ class ReBloomFilter(object):
         self.__base_key = name
         self.is_byte = is_byte
         self.hash_seed = hash_seed
+        self.expire = expire
         self.__get_size()
 
         self._init_filter(is_init=is_init)
@@ -67,7 +71,8 @@ class ReBloomFilter(object):
         :return:
         """
         if self.is_byte:
-            self.__size += 8 - self.__size % 8
+            mod = self.__size % 8
+            self.__size += (8 - mod) if mod else 0
         return self.__size
 
     def __contains__(self, key):
@@ -87,6 +92,16 @@ class ReBloomFilter(object):
         """
         return [mmh3.hash(key, i, False) % self.__size for i in
                 range(self.hash_seed, self.hash_seed + self.hash_count)]
+
+    def set_bloom_value(self, value):
+        """
+        @desc 直接设置过滤器的数据
+        :param value:
+        :return:
+        """
+        self._client.set(self.__base_key, value)
+        if self.expire:
+            self._client.expire(self.__base_key, self.expire)
 
     def __len__(self):
         """重写len,计算过滤器总计数"""
@@ -108,6 +123,10 @@ class ReBloomFilter(object):
         """
         return len(self)
 
+    @property
+    def client(self):
+        return self._client
+
     def add(self, key):
         """
         @desc 往过滤器中添加数据
@@ -120,6 +139,17 @@ class ReBloomFilter(object):
             pipe.setbit(self.__base_key, k, 1)
         return not all(pipe.execute())
 
+    def madd(self, keys):
+        """
+        @desc 批量添加数据
+        :param keys:
+        :return:
+        """
+        if isinstance(keys, str):
+            keys = [keys]
+        for key in keys:
+            self.add(key)
+
     def exists(self, key):
         """
         @desc 判断是否存在一个key，当返回False时一定正确，
@@ -130,6 +160,16 @@ class ReBloomFilter(object):
         if key in self:
             return True
         return False
+
+    def mexists(self, keys):
+        """
+        @desc 批量判断key是否存在
+        :param keys: list
+        :return: list
+        """
+        if isinstance(keys, str):
+            keys = [keys]
+        return [self.exists(key) for key in keys]
 
     def union(self, other, dest):
         """
@@ -143,7 +183,7 @@ class ReBloomFilter(object):
             raise ValueError("两个过滤器的size、error_rate、hash_seed参数必须一致！")
         self._client.bitop("or", dest, self.__base_key, other.__base_key)
         new_bloom = ReBloomFilter(self._client, dest, self.size, self.error_rate, self.is_byte, self.hash_seed,
-                                  is_init=False)
+                                  is_init=False, expire=self.expire)
         return new_bloom
 
     def intersection(self, other, dest):
@@ -158,7 +198,7 @@ class ReBloomFilter(object):
             raise ValueError("两个过滤器的size、error_rate、hash_seed参数必须一致！")
         self._client.bitop("and", dest, self.__base_key, other.__base_key)
         new_bloom = ReBloomFilter(self._client, dest, self.size, self.error_rate, self.is_byte, self.hash_seed,
-                                  is_init=False)
+                                  is_init=False, expire=self.expire)
         return new_bloom
 
     def copy(self, dest):
@@ -169,10 +209,50 @@ class ReBloomFilter(object):
         """
         zero_key = "{}:{}".format(dest, 0)
         zero_bloom = ReBloomFilter(self._client, zero_key, self.size, self.error_rate, self.is_byte, self.hash_seed,
-                                   is_init=True)
+                                   is_init=False, expire=self.expire)
         copy_bloom = self.union(zero_bloom, dest=dest)
         self._client.expire(zero_key, -1)
         return copy_bloom
+
+    def tofile(self, f):
+        """
+        @desc 将bloomFilter保存到文件,为了便于理解，使用json序列化
+        :param f: file对象
+        :return:
+        """
+        assert isinstance(f, file)
+        bloom_data = base64.b64encode(self._client.get(self.__base_key))
+        data = json.dumps({
+            "hash": "mmh3",
+            "size": self.size,
+            "error_rate": self.error_rate,
+            "is_byte": self.is_byte,
+            "hash_seed": self.hash_seed,
+            "is_init": False,
+            "name": self.__base_key,
+            "expire": self.expire,
+            "bloom_data": bloom_data
+        })
+        f.write(data)
+
+    @classmethod
+    def fromfile(self, f, cache):
+        """
+        @desc 从文件中读取创建一个bloomFilter
+        :param f: file对象
+        :param cache: redis连接对象
+        :return:
+        """
+        assert isinstance(f, file)
+        data = json.loads(f.read())
+        if data["hash"] != "mmh3":
+            raise ValueError("the data'hash is must be mmh3")
+        data.pop("hash", None)
+        data["cache"] = cache
+        data_bloom = base64.b64decode(data.pop("bloom_data", ""))
+        bloom = ReBloomFilter(**data)
+        bloom.set_bloom_value(data_bloom)
+        return bloom
 
 
 class ScalableReBloomFilter(object):

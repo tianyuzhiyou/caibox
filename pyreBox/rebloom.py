@@ -11,6 +11,7 @@ redis4.0.0版本后内部支持了BloomFilter的插件，但是对于不想使�
 import json
 import base64
 import mmh3
+import math
 
 
 class ReBloomFilter(object):
@@ -33,7 +34,7 @@ class ReBloomFilter(object):
             raise ValueError("size must be > 0")
 
         self._client = cache
-        self.__size = size
+        self.capacity = size
         self.error_rate = error_rate
         self.hash_count = self.__get_hash_count(error_rate)
         self.__base_key = name
@@ -70,6 +71,11 @@ class ReBloomFilter(object):
         @desc 获取长度
         :return:
         """
+        num_slices = int(math.ceil(math.log(1.0 / self.error_rate, 2)))
+        bits_per_slice = int(math.ceil(
+            (self.capacity * abs(math.log(self.error_rate))) /
+            (num_slices * (math.log(2) ** 2))))
+        self.__size = num_slices * bits_per_slice
         if self.is_byte:
             mod = self.__size % 8
             self.__size += (8 - mod) if mod else 0
@@ -127,6 +133,10 @@ class ReBloomFilter(object):
     def client(self):
         return self._client
 
+    @property
+    def key(self):
+        return self.__base_key
+
     def add(self, key):
         """
         @desc 往过滤器中添加数据
@@ -179,10 +189,10 @@ class ReBloomFilter(object):
         :return:
         """
         assert isinstance(other, ReBloomFilter)
-        if self.hash_count != other.hash_count or self.hash_seed != other.hash_seed or self.size != other.size:
-            raise ValueError("两个过滤器的size、error_rate、hash_seed参数必须一致！")
+        if self.hash_count != other.hash_count or self.hash_seed != other.hash_seed or self.capacity != other.capacity:
+            raise ValueError("两个过滤器的capacity、error_rate、hash_seed参数必须一致！")
         self._client.bitop("or", dest, self.__base_key, other.__base_key)
-        new_bloom = ReBloomFilter(self._client, dest, self.size, self.error_rate, self.is_byte, self.hash_seed,
+        new_bloom = ReBloomFilter(self._client, dest, self.capacity, self.error_rate, self.is_byte, self.hash_seed,
                                   is_init=False, expire=self.expire)
         return new_bloom
 
@@ -194,10 +204,10 @@ class ReBloomFilter(object):
         :return:
         """
         assert isinstance(other, ReBloomFilter)
-        if self.hash_count != other.hash_count or self.hash_seed != other.hash_seed or self.size != other.size:
-            raise ValueError("两个过滤器的size、error_rate、hash_seed参数必须一致！")
+        if self.hash_count != other.hash_count or self.hash_seed != other.hash_seed or self.capacity != other.capacity:
+            raise ValueError("两个过滤器的capacity、error_rate、hash_seed参数必须一致！")
         self._client.bitop("and", dest, self.__base_key, other.__base_key)
-        new_bloom = ReBloomFilter(self._client, dest, self.size, self.error_rate, self.is_byte, self.hash_seed,
+        new_bloom = ReBloomFilter(self._client, dest, self.capacity, self.error_rate, self.is_byte, self.hash_seed,
                                   is_init=False, expire=self.expire)
         return new_bloom
 
@@ -208,7 +218,7 @@ class ReBloomFilter(object):
         :return:
         """
         zero_key = "{}:{}".format(dest, 0)
-        zero_bloom = ReBloomFilter(self._client, zero_key, self.size, self.error_rate, self.is_byte, self.hash_seed,
+        zero_bloom = ReBloomFilter(self._client, zero_key, self.capacity, self.error_rate, self.is_byte, self.hash_seed,
                                    is_init=False, expire=self.expire)
         copy_bloom = self.union(zero_bloom, dest=dest)
         self._client.expire(zero_key, -1)
@@ -224,7 +234,7 @@ class ReBloomFilter(object):
         bloom_data = base64.b64encode(self._client.get(self.__base_key))
         data = json.dumps({
             "hash": "mmh3",
-            "size": self.size,
+            "size": self.capacity,
             "error_rate": self.error_rate,
             "is_byte": self.is_byte,
             "hash_seed": self.hash_seed,
@@ -257,7 +267,7 @@ class ReBloomFilter(object):
 
 class ScalableReBloomFilter(object):
 
-    def __init__(self, cache, name, init_size, error_rate=0.001, is_byte=True):
+    def __init__(self, cache, name, init_size, error_rate=0.001, is_byte=True, hash_seed=41, is_init=False):
         """
         @desc 封装基于redis的自动扩容的bloom过滤器
         :param init_size: 初始的过滤器长度
@@ -272,23 +282,25 @@ class ScalableReBloomFilter(object):
             raise ValueError("init_size must be > 0")
 
         self._client = cache
-        self.__size = init_size
-        self.__hash_count = self.__get_hash_count(error_rate)
+        self.capacity = init_size
+        self.hash_count = self.__get_hash_count(error_rate)
         self.__base_key = name
-        self.__is_byte = is_byte
+        self.is_byte = is_byte
+        self.error_rate = error_rate
+        self.hash_seed = hash_seed
 
         self.filters = []
-        self._init_filter()
         self.__get_size()
+        self._init_filter(is_init)
 
-    def _init_filter(self):
+    def _init_filter(self, is_init):
         """
         @desc 初始化空间
         :return:
         """
-        self.__key1 = "{}:{}".format(self.__base_key, 0)
-        self.__base_filter = self._client.setbit(self.__key1, self.__size, 0)
-        self.filters.append(self.__base_filter)
+        if is_init:
+            self.__base_filter = self._client.setbit(self.__base_key, self.__size, 0)
+            self.filters.append(self.__base_filter)
 
     def __get_hash_count(self, value):
         """
@@ -308,8 +320,14 @@ class ScalableReBloomFilter(object):
         @desc 获取长度
         :return:
         """
-        if self.__is_byte:
-            self.__size += 8 - self.__size % 8
+        num_slices = int(math.ceil(math.log(1.0 / self.error_rate, 2)))
+        bits_per_slice = int(math.ceil(
+            (self.capacity * abs(math.log(self.error_rate))) /
+            (num_slices * (math.log(2) ** 2))))
+        self.__size = num_slices * bits_per_slice
+        if self.is_byte:
+            mod = self.__size % 8
+            self.__size += (8 - mod) if mod else 0
         return self.__size
 
     def __contains__(self, key):
@@ -331,7 +349,7 @@ class ScalableReBloomFilter(object):
         @desc 返回过滤器的总大小
         :return:
         """
-        pass
+        return sum([f.size for f in self.filters])
 
     @property
     def count(self):
@@ -339,12 +357,117 @@ class ScalableReBloomFilter(object):
         @desc 返回当前过滤器计数
         :return:
         """
-        return len(self)
+        return sum([f.count for f in self.filters])
 
-    def add(self, value):
+    def add(self, key):
         """
         @desc 往过滤器中添加数据
         :param value:
+        :return: 返回实际过滤器数据结构是否发生变动
+        """
+        if key in self:
+            return False
+        if not self.filters:
+            ft = ReBloomFilter(self._client, self.__base_key, self.capacity,
+                                   self.error_rate, self.is_byte, self.hash_seed)
+            self.filters.append(ft)
+        else:
+            ft = self.filters[-1]
+            # 当计数开始大于初始值时触发线性扩容
+            if ft.count >= ft.capacity:
+                key1 = "{}:{}".format(self.__base_key, len(self.filters))
+                ft = ReBloomFilter(self._client, key1, self.capacity,
+                                   self.error_rate, self.is_byte, self.hash_seed)
+                self.filters.append(ft)
+        return ft.add(key)
+
+    def madd(self, keys):
+        """
+        @desc 批量添加数据
+        :param keys:
         :return:
         """
-        pass
+        if isinstance(keys, str):
+            keys = [keys]
+        for key in keys:
+            self.add(key)
+
+    def exists(self, key):
+        """
+        @desc 判断是否存在一个key，当返回False时一定正确，
+        但是返回True是可能不正确
+        :param key:
+        :return:
+        """
+        if key in self:
+            return True
+        return False
+
+    def mexists(self, keys):
+        """
+        @desc 批量判断key是否存在
+        :param keys: list
+        :return: list
+        """
+        if isinstance(keys, str):
+            keys = [keys]
+        return [self.exists(key) for key in keys]
+
+    def tofile(self, f):
+        """
+        @desc 将bloomFilter保存到文件,为了便于理解，使用json序列化
+        :param f: file对象
+        :return:
+        """
+        assert isinstance(f, file)
+        data_list = [json.dumps({
+            "hash": "mmh3",
+            "init_size": self.capacity,
+            "error_rate": self.error_rate,
+            "is_byte": self.is_byte,
+            "hash_seed": self.hash_seed,
+            "is_init": False,
+            "name": self.__base_key,
+        }) + "\n"]
+        for i, f in self.filters:
+            key = self.__base_key if i == 0 else "{}:{}".format(self.__base_key, i)
+            bloom_data = base64.b64encode(self._client.get(key))
+            data = json.dumps({
+                "hash": "mmh3",
+                "size": f.capacity,
+                "error_rate": f.error_rate,
+                "is_byte": f.is_byte,
+                "hash_seed": f.hash_seed,
+                "is_init": False,
+                "name": f.key,
+                "expire": None,
+                "bloom_data": bloom_data
+            })
+            data_list.append(data + "\n")
+        f.writelines(data_list)
+
+    @classmethod
+    def fromfile(self, f, cache):
+        """
+        @desc 从文件中读取创建一个bloomFilter
+        :param f: file对象
+        :param cache: redis连接对象
+        :return:
+        """
+        assert isinstance(f, file)
+        data_list = f.readlines()
+        base_data = json.dumps(data_list[0])
+        base_data.pop("hash", None)
+        base_data["cache"] = cache
+        new_filter = ScalableReBloomFilter(**base_data)
+        for data in data_list[1:]:
+            data = json.loads(data)
+            if data["hash"] != "mmh3":
+                raise ValueError("the data'hash is must be mmh3")
+            data.pop("hash", None)
+            data["cache"] = cache
+            data_bloom = base64.b64decode(data.pop("bloom_data", ""))
+            bloom = ReBloomFilter(**data)
+            bloom.set_bloom_value(data_bloom)
+            new_filter.filters.append(bloom)
+        return new_filter
